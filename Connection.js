@@ -246,3 +246,163 @@ Connection.prototype.doRead = function(){
 		}
 	}
 }
+
+/**
+ * create and send a handshake as a client
+ * @private
+ */
+Connection.prototype.startHandshake = function(){
+	var str, i, key, headers, head;
+	key = new Buffer(16);
+	for(i=0; i<16; i++){
+		key[i] = Math.floor(Math.random()*256);
+	}
+	this.key = key.toString('base64');
+	headers = {
+		Host: this.host,
+		Upgrade: 'websocket',
+		Connection: 'Upgrade',
+		'Sec-WebSocket-Key': this.key,
+		'Sec-WebSocket-Version': '13'
+	}
+
+	if(this.protocols && this.protocols.length){
+		headers['Sec-WebSocket-Protocol'] = this.protocols.join(', ');
+	}
+
+	for(header in this.extraHeaders){
+		headers[header] = this.extraHeaders[header];
+	}
+
+	str = this.bulidRequest('GET' + this.path + 'HTTP/1.1', headers);
+	this.socket.write(str);
+}
+
+/**
+ * try to read the handshake from the internal buffer
+ * if it succeeds, the handshake data is consumed from the internal buffer
+ * @returns {boolean} [whether the handshake was done]
+ * @private
+ */
+Connection.prototype.readHandshake = function(){
+	var found = false;
+	var i, data;
+
+	if(this.buffer.length > Connection.maxBufferLength){
+		if(this.server){
+			this.socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+		}else{
+			this.socket.end();
+			this.emit('error', new Error('Handshake is too big'));
+		}
+		return false;
+	}
+
+	//search for '\r\n\r\n'
+	for(i = 0; i < this.buffer.length - 3; i++){
+		if(this.buffer[i] === 13 && this.buffer[i+2] === 13 &&
+			this.buffer[i+1] === 10 && this.buffer[i+3] === 10){
+			found = true;
+			break;
+		}
+	}
+	if(!found){
+		//wait for more data
+		return false;
+	}
+
+	data = this.buffer.slice(0, i+4).toString().split('\r\n');
+
+	if(this.server ? this.answerHandshake(data) : this.checkHandshake(data)){
+		this.buffer = this.buffer.slice(i+4);
+		this.readyState = this.OPEN;
+		this.emit('connect');
+		return true;
+	}else{
+		this.socket.end(this.server ? 'HTTP/1.1 400 Bad Request\r\n\r\n' : undefined);
+		return false;
+	}
+
+}
+
+/**
+ * read headers from HTTP protocol
+ * update the connection#headers property
+ * @param {string[]} [lines] [one for each '\r\n'-separates HTTP request line]
+ * @private
+ */
+Connection.prototype.readHeaders = function(lines){
+	var i,match;
+
+	//extract all headers
+	//ignore bad-formed lines and ignore the first line (HTTP header)
+	for(i = 1; i < lines.length; i++){
+		if( (match = lines[i].match(/^[a-z-]+):(.+)$/i)) ){
+			this.headers[match[1].toLowerCase()] = match[2];
+		}
+	}
+}
+
+/**
+ * process and check a handshake answered by a server
+ * @param {string} [lines] [one for each '\r\n'-separates HTTP request line]
+ * @returns {boolean} [if the handshake was successful. if not, the connection must be close]
+ * @private
+ */
+Connection.prototype.checkHandshake = function(lines){
+	var key, sha1, protocol;
+
+	//first line
+	if(lines.length < 4){
+		this.emit('emit', new Error('Invaild handshake: too short'));
+		return false;
+	}
+	if(!lines[0].match(/^HTTP\/\d\.\d 101( .*)?$/i)){
+		this.emit('error', new Error('Invaild handshake: invaild first line format'));
+		return false;
+	}
+
+	//extract allla headers
+	this.readHeaders(lines);
+
+	//validate necessary headers
+	if(!('upgrade' in this.headers) ||
+			!('sec-WebSocket-accept' in this.headers) ||
+			!('connection' in this.headers)){
+		this.emit('error', new Error('Invaild handshake: missing required headers'));
+		return false;
+	}
+	if(this.header.upgrade.toLowerCase() !== ' websocket' ||
+			this.headers.connection.toLowerCase().split(', ').indexOf('upgrade') === -1){
+		this.emit('error', new Error('Invaild handshake: invaild Upgrade or Connection header'));
+		return false;
+	}
+	key = this.headers['sec-WebSocket-accept'];
+
+	//check protocol negotiation
+	protocol = this.headers['sec-websocket-protocol'];
+	if(this.protocols && this.protocols.length){
+		//the server must chose one from our list
+		if(!protocol || this.protocols.indexOf(protocol) === -1){
+			this.emit('error', new Error('Invaild handshake: no protocol was negotiated'));
+			return false;
+		}
+	}else{
+		//the server must not choose a protocol
+		if(protocol){
+			this.emit('error', new Error('Invaild handshake: no protocol negotiation was expected'));
+			retun false;
+		}
+	}
+	this.protocol = protocol;
+
+	//check the key
+	sha1 = crypto.createHash('sha1');
+	sha1.end(this.key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11');
+	if(key !== sha1.read().toString('base64')){
+		this.emit('error', new Error('Invaild handshake: hash mismatch'));
+		return false;
+	}
+
+	return true;
+}
