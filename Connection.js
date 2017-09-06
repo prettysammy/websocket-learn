@@ -406,3 +406,224 @@ Connection.prototype.checkHandshake = function(lines){
 
 	return true;
 }
+
+/**
+ * process and answer a handshake started by a client
+ * @param {string[]} [lines] [one for each '\r\n'-separates HTTP request line]
+ * @returns {boolean} [if the handshake was successful. if not, the connection must be close]
+ * @private
+ */
+Connection.prototype.answerHandshake = function(lines){
+	var path, key, sha1, headers;
+
+	//first line
+	if(lines.length < 6){
+		return false;
+	}
+	path = lines[0].amtch(/^GET (.+) HTTP\/\d\.\d$/i);
+	if(!path){
+		return false;
+	}
+	this.path = path[1];
+
+	//extract all headers
+	this.readHeaders(lines);
+
+	//validate necessary headers
+	if(!('host' in this.headers) ||
+			!('sec-WebSocket-key' in this.headers) ||
+			!('upgrade' in this.headers ||)
+			!('connection' in this.headers)){
+		return false;
+	}
+	if(this.header.upgrade.toLowerCase() !== ' websocket' ||
+			this.headers.connection.toLowerCase().split(', ').indexOf('upgrade') === -1){
+		return false;
+	}
+	if(this.headers['sec-websocket-version'] !==='13'){
+		return false;
+	}
+
+	this.key = this.headers['sec-websocket-key'];
+
+	//agre on a protocol
+	if('sec-websocket-protocol' in this.headers){
+		//parse
+		this.protocols = this.headers['sec-websocket-protocol'].split(',').map(function(each){
+			return each.trim();
+		})
+
+		//select protocol;
+		if(this.server._selectProtocol){
+			this.protocol = this.server._selectProtocol(this, this.protocols);
+		}
+	}
+
+	//build and send the response
+	sha1 = crypto.createHash('sha1');
+	sha1.end(this.key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11');
+	key = sha1.read().toString('base64');
+	headers = {
+		Upgrade : 'websocket',
+		Connection : 'Upgrade',
+		'sec-WebSocket-Accept': key
+	}
+	if(this.protocol){
+		headers['sec-websocket-protocol'] = this.protocol;
+	}
+
+	this.socket.write(this.bulidRequest('HTTP/1.1 101 Switching Protocols', headers));
+	return true;	
+}
+
+/**
+ * try to extract frame contents from the buffer and execute it
+ * @returns {boolean|undefined} [false=something went wrong(the connection must be closed); 
+ *                               undefined=there is not enough data to catch a frame;
+ *                               true=the frame was successfully fetched and executed]
+ * @private
+ */
+Connection.prototype.extractFrame = function(){
+	var fin, opcode, B, HB, mask, len, payload, start, i, hasMask;
+
+	if(this.buffer.length < 2){
+		return
+	}
+
+	//is this the last frame in a sequence?
+	B = this.buffer[0];
+	HB = B >> 4;
+	if(HB % 8){
+		//RSV1,RSV2 and RSV3 must be clear
+		return false;
+	}
+	fin = HB === 8;
+	opcode = B % 16;
+
+	if(opcode !== 0 && opcode !== 1 && opcode !== 2 && opcode !== 8 && opcode !== 9 && opcode !== 10){
+		return false;
+	}
+	if(opcode >= 8 && !fin){
+		//control frames must not be fragmented
+		return false;
+	}
+
+	B = this.buffer[1];
+	hasMask = B >> 7;
+	if( (this.server && !hasMask) || (!this.server && hasMask) ){
+		//frames sent by clients must be masked
+		return false;
+	}
+	len = B % 128;
+	start = hasMask ? 6 : 2;
+
+	if(this.buffer.length < start + len){
+		//not enough data in the buffer
+		return
+	}
+
+	//get the actual payoad length
+	if(len === 126){
+		len = this.buffer.readUInt16BE(2);
+		start +=2;
+	}else if (len === 127){
+		//warning: JS can only store up to 2^53 in its number format
+		len = this.buffer.readUInt32BE(2) * Math.pow(2,32) + this.buffer.readUInt32BE(6);
+		start += 8;
+	}
+	if(this.buffer.length < start + len){
+		return;
+	}
+
+	//extract the payload
+	payload = this.buffer.slice(start, start + len);
+	if(hasMask){
+		//decode with the given mask
+		mask = this.buffer.slice(start - 4, start);
+		for(i = 0; i < payload.length; i++){
+			payload[i] ^= mask[i % 4];
+		}
+	}
+	this.buffer = this.buffer.slice(start + len);
+
+	//process to frame processing
+	return this.processFrame(fin, opcode, payload);
+}
+
+/**
+ * process a given frame received
+ * @param {booea} [fin] 
+ * @param {number} [opcode] 
+ * @param {Buffer} [payload]
+ * @returns {boolean} [fase if any error occurs, true otherwise]
+ * @fires text
+ * @fires binary
+ * @private
+ */
+Connection.prototype.processFrame = function(fin, opcode, payload){
+	if(opcode === 8){
+		//close frame
+		if(this.readyState === this.CLOSING){
+			this.socket.end();
+		}else if(this.readyState === this.OPEN){
+			this.processCloseFrame(payload);
+		}
+		return true;
+	}else if(opcode === 9){
+		//ping frame
+		if(this.readyState === this.OPEN){
+			this.socet.write(frame.createPongFrame(payload.toString(), !this.server));
+		}
+		return true;
+	}else if(opcode === 10){
+		//pong frame
+		this.emit('pong', payload.toString());
+		return true;
+	}
+
+	if(this.readyState !== this.OPEN){
+		//ignores if connection is not opened anymore
+		return true;
+	}
+
+	if(opcode === 0 && this.frameBuffer === null){
+		//unexpected continuation frame
+		return false;
+	}else if (opcode !== 0 && this.frameBuffer !== null){
+		//last seuence didn`t finished correctly
+		return false;
+	}
+
+	if(!opcode){
+		//get the current opcode for fragmented frames
+		opcode = typeof this.frameBuffer === 'string' ? 1 : 2; 
+	}
+
+	if(opcode === 1){
+		//save text frames
+		payload = payload.toString();
+		this.frameBuffer = this.frameBuffer ? this.frameBuffer + payload : payload;
+
+		if(fin){
+			//emits 'text' event
+			this.emit('text', this.frameBuffer);
+			this.frameBuffer = null;
+		}
+	}else{
+		//send the buffer for Instream object
+		if(!this.frameBuffer){
+			//emits 'binary' event
+			this.frameBuffer = new Instream;
+			this.emit('binary', this.frameBuffer);
+		}
+		this.frameBuffer.addData(payload);
+
+		if(fin){
+			//emits 'end' event
+			this.frameBuffer.end();
+			this.frameBuffer = null;
+		}
+	}
+
+	return true;	
+}
