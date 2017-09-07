@@ -627,3 +627,41 @@ Connection.prototype.processFrame = function(fin, opcode, payload){
 
 	return true;	
 }
+
+/**
+ * process a close frame, emitting the close event and sending back the frame
+ * @param {Buffer} [payload] 
+ * @fires close
+ * @private
+ */
+Connection.prototype.processCloseFrame = function(payload){
+	var code, reason;
+	if(payload.length >= 2){
+		code = payload.readUInt16BE(0);
+		reason = payload.slice(2).toString();
+	}else{
+		code = 1005;
+		reason = '';
+	}
+	this.socket.write(frame.createCloseFrame(code, reason, !this.server));
+	this.readyState = this.CLOSED;
+	this.emit('close', code, reason);
+}
+
+/**
+ * build the header string
+ * @param {string} [requestLine] 
+ * @param {Objective<string>} [headers] 
+ * @returns {string} 
+ * @private
+ */
+Connection.prototype.bulidRequest = function(requestLine, headers){
+	var headerString = requestLine + '\r\n';
+	var headerName;
+
+	for(headerName in headers){
+		headerString += headerName + ': ' + headers[headerName] + '\r\n';
+	}
+
+	return headerString + '\r\n';
+}
