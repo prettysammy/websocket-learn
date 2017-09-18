@@ -51,3 +51,50 @@ exports.connect = function(URL, options, callback){
 
 	return new Connection(socket, connectionOptions, callback);
 }
+
+/**
+ * set the minimun size of a pack of binary data to send in a single frame
+ * @param {number} [bytes] 
+ */
+exports.setBinaryFragmentation = function(bytes){
+	Connection.binaryFramentation = bytes;
+}
+
+/**
+ * set the maximum size the internal buffer can grow, to avoid memory attacks
+ * @param {number} [bytes] 
+ */
+exports.setMaxBufferLength = function(bytes){
+	Connection.maxBufferLength = bytes;
+}
+
+/**
+ * parse the websocket URL
+ * @param {string} [URL] 
+ * @returns {Object} 
+ * @private
+ */
+function parseWSURL(URL){
+	var parts,secure;
+
+	parts = url.parse(URL);
+
+	parts.protocol = parts.protocol || 'ws:';
+	if(parts.protocol === 'ws:'){
+		secure = false;
+	}else if(parts.protocol === 'wss:'){
+		secure = true;
+	}else{
+		throw new Error('Invaild protocol' + parts.protocol + '. It must be ws or wss');
+	}
+
+	parts.port = parts.port || (secure ? 443 : 80);
+	parts.path = parts.path || '/';
+
+	return {
+		path: parts.path,
+		port: parts.port,
+		secure: secure,
+		host: parts.hostname
+	}
+}
